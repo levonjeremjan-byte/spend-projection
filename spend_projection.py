@@ -168,6 +168,10 @@ def read_am_files(cfg):
                 if reason_slug in cfg["exclude_spend_objectives"]:
                     continue
 
+                am_comment = ""
+                if len(row) > 23 and row[23] is not None:
+                    am_comment = str(row[23])
+
                 all_campaigns.append({
                     "am_name": am_name,
                     "am_file": fname,
@@ -183,6 +187,7 @@ def read_am_files(cfg):
                     "reason_slug": reason_slug,
                     "reason_display": REASON_DISPLAY.get(reason_slug, reason_slug),
                     "bonus_type": CAMPAIGN_TYPE_MAP.get(campaign_type, "item_price"),
+                    "am_comment": am_comment,
                 })
         wb.close()
 
@@ -403,6 +408,87 @@ def compute_wow_changes(projected_df, target_weeks):
     return pd.DataFrame(changes).sort_values(
         ["Transition", "Change", "Spend Impact (EUR)"], ascending=[True, True, False]
     )
+
+
+# ─── Liquidity Split ─────────────────────────────────────────────────────────
+
+DEFAULT_LIQUIDITY_BASE = 30  # fallback when comment mentions liquidity but no numbers
+
+
+def parse_liquidity_split(comment, discount_pct):
+    """Extract (liquidity_base, am_topup) from an AM comment string.
+
+    Returns (None, None) if the campaign is not a liquidity top-up.
+    """
+    if not comment:
+        return None, None
+    comment_lower = comment.lower()
+    if "liquid" not in comment_lower:
+        return None, None
+
+    xy = re.search(r"(\d+)\s*\+\s*(\d+)", comment)
+    if xy:
+        return int(xy.group(1)), int(xy.group(2))
+
+    pct = re.search(r"(\d+)\s*%?\s*liquidity", comment_lower)
+    if pct:
+        base = int(pct.group(1))
+        topup = (discount_pct or 0) - base
+        return base, max(topup, 0)
+
+    exp = re.search(r"expansion\s+(\d+)\s+in", comment_lower)
+    if exp:
+        base = int(exp.group(1))
+        topup = (discount_pct or 0) - base
+        return base, max(topup, 0)
+
+    if discount_pct and discount_pct > DEFAULT_LIQUIDITY_BASE:
+        return DEFAULT_LIQUIDITY_BASE, discount_pct - DEFAULT_LIQUIDITY_BASE
+    elif discount_pct:
+        return discount_pct, 0
+
+    return None, None
+
+
+def enrich_with_liquidity(projected_df):
+    """Add liquidity split columns to projected_df using the am_comment field.
+
+    For liquidity campaigns the projected spend is split proportionally:
+        am_spend_eur       = projected * (am_topup / total_discount)
+        liquidity_spend_eur = projected * (liquidity_base / total_discount)
+    Non-liquidity campaigns keep 100% in am_spend_eur.
+    """
+    df = projected_df.copy()
+    df["is_liquidity"] = False
+    df["liquidity_base_pct"] = np.nan
+    df["am_topup_pct"] = np.nan
+    df["am_spend_eur"] = df["weekly_projected_bolt_eur"]
+    df["liquidity_spend_eur"] = 0.0
+
+    for idx, row in df.iterrows():
+        comment = row.get("am_comment", "")
+        liq_base, am_topup = parse_liquidity_split(comment, row["discount_pct"])
+        if liq_base is None:
+            continue
+
+        total_disc = liq_base + am_topup
+        if total_disc > 0:
+            liq_ratio = liq_base / total_disc
+            am_ratio = am_topup / total_disc
+        else:
+            liq_ratio, am_ratio = 0, 1
+
+        df.at[idx, "is_liquidity"] = True
+        df.at[idx, "liquidity_base_pct"] = liq_base
+        df.at[idx, "am_topup_pct"] = am_topup
+        df.at[idx, "am_spend_eur"] = row["weekly_projected_bolt_eur"] * am_ratio
+        df.at[idx, "liquidity_spend_eur"] = row["weekly_projected_bolt_eur"] * liq_ratio
+
+    n_liq = df["is_liquidity"].sum()
+    total_liq = df["liquidity_spend_eur"].sum()
+    print(f"  Liquidity enrichment: {n_liq} campaigns tagged, "
+          f"{total_liq:,.0f} EUR separated")
+    return df
 
 
 # ─── Excel Writer ────────────────────────────────────────────────────────────

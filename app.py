@@ -24,6 +24,7 @@ from spend_projection import (
     compute_weekly_gmv,
     match_and_project,
     compute_wow_changes,
+    enrich_with_liquidity,
     iso_week_to_dates,
 )
 
@@ -133,6 +134,7 @@ def run_pipeline(cfg):
         projected_df = match_and_project(
             planned_df, benchmarks, fallback, provider_gmv, weekly_gmv
         )
+        projected_df = enrich_with_liquidity(projected_df)
         wow_df = compute_wow_changes(projected_df, cfg["target_weeks"])
     return {
         "projected_df": projected_df,
@@ -269,11 +271,29 @@ with tab_proj:
         total_gmv = sum(wgmv.get(w, 0) for w in tw)
         total_spend = proj["weekly_projected_bolt_eur"].sum()
 
+        total_liq = proj["liquidity_spend_eur"].sum() if "liquidity_spend_eur" in proj.columns else 0
+        total_am_only = proj["am_spend_eur"].sum() if "am_spend_eur" in proj.columns else total_spend
+        has_liq = total_liq > 0
+
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Total Projected Spend", f"€{total_spend:,.0f}")
         m2.metric("% of GMV", f"{total_spend / total_gmv * 100:.3f}%" if total_gmv else "—")
-        m3.metric(f"With {int(margin*100)}% Margin", f"€{total_spend * (1 + margin):,.0f}")
+        if has_liq:
+            m3.metric("AM Spend (excl. liquidity)", f"€{total_am_only:,.0f}",
+                      delta=f"-€{total_liq:,.0f} liquidity separated",
+                      delta_color="off")
+        else:
+            m3.metric(f"With {int(margin*100)}% Margin", f"€{total_spend * (1 + margin):,.0f}")
         m4.metric("Campaigns Processed", f"{len(proj):,}")
+
+        if has_liq:
+            m5, m6, m7, m8 = st.columns(4)
+            m5.metric(f"AM Spend + {int(margin*100)}% Margin", f"€{total_am_only * (1 + margin):,.0f}")
+            m6.metric("AM Spend % of GMV",
+                      f"{total_am_only / total_gmv * 100:.3f}%" if total_gmv else "—")
+            m7.metric("Liquidity to Separate", f"€{total_liq:,.0f}")
+            n_liq = proj["is_liquidity"].sum() if "is_liquidity" in proj.columns else 0
+            m8.metric("Liquidity Campaigns", f"{n_liq:,}")
 
         st.caption(
             f"Run at {st.session_state['run_ts'].strftime('%H:%M:%S')} · "
@@ -281,10 +301,12 @@ with tab_proj:
             f"Weeks {tw[0]}–{tw[-1]}"
         )
 
-        sub_reason, sub_am, sub_wow, sub_flags, sub_detail = st.tabs([
+        tab_names = [
             "By Spend Objective", "By Account Manager",
+            "Liquidity Split",
             "Week-over-Week Changes", "Flagged Campaigns", "Campaign Detail",
-        ])
+        ]
+        sub_reason, sub_am, sub_liq, sub_wow, sub_flags, sub_detail = st.tabs(tab_names)
 
         # ── By Spend Objective ────────────────────────────────────────
         with sub_reason:
@@ -423,6 +445,146 @@ with tab_proj:
                 bd.style.format({c: "€{:,.0f}" for c in bd.columns}),
                 hide_index=False,
             )
+
+        # ── Liquidity Split ─────────────────────────────────────────────
+        with sub_liq:
+            if not has_liq:
+                st.info("No liquidity campaigns detected. Campaigns are tagged as "
+                        "liquidity when their AM COMMENTS column (col X) mentions "
+                        "'liquidity'.")
+            else:
+                liq_df = proj[proj["is_liquidity"]].copy()
+                non_liq_df = proj[~proj["is_liquidity"]].copy()
+
+                st.markdown("**Spend split: AM top-up vs general liquidity base**")
+                st.caption(
+                    "Liquidity campaigns are detected from the AM COMMENTS column. "
+                    "The projected spend is split proportionally using the "
+                    "discount split (e.g. 30+10 → 75% liquidity / 25% AM)."
+                )
+
+                # ── Per-AM breakdown with liquidity split ──
+                st.markdown("---")
+                st.markdown("**Breakdown per Account Manager**")
+
+                am_liq_data = []
+                am_order_liq = (
+                    proj.groupby("am_name")["weekly_projected_bolt_eur"]
+                    .sum().sort_values(ascending=False).index
+                )
+                for am in am_order_liq:
+                    am_d = proj[proj["am_name"] == am]
+                    am_liq_data.append({
+                        "Account Manager": am,
+                        **{f"W{w} AM": am_d[am_d["week"] == w]["am_spend_eur"].sum() for w in tw},
+                        **{f"W{w} Liq": am_d[am_d["week"] == w]["liquidity_spend_eur"].sum() for w in tw},
+                        "Total AM Spend": am_d["am_spend_eur"].sum(),
+                        "Total Liquidity": am_d["liquidity_spend_eur"].sum(),
+                        "Total Combined": am_d["weekly_projected_bolt_eur"].sum(),
+                    })
+                am_liq_df = pd.DataFrame(am_liq_data).set_index("Account Manager")
+
+                totals_row = am_liq_df.sum().to_frame().T
+                totals_row.index = ["GRAND TOTAL"]
+                am_liq_display = pd.concat([am_liq_df, totals_row])
+
+                fmt_cols = {c: "€{:,.0f}" for c in am_liq_display.columns}
+                st.dataframe(
+                    am_liq_display.style.format(fmt_cols),
+                    hide_index=False,
+                )
+                st.download_button("Download AM liquidity breakdown as CSV",
+                                   am_liq_display.to_csv(),
+                                   "am_liquidity_breakdown.csv", "text/csv",
+                                   key="dl_am_liq")
+
+                # ── Per-AM per-Reason with split ──
+                st.markdown("---")
+                st.markdown("**Breakdown per Person / Week / Reason**")
+
+                sel_am_liq = st.selectbox(
+                    "Filter by AM", ["All"] + list(am_order_liq),
+                    key="liq_am_filter",
+                )
+                src_liq = proj if sel_am_liq == "All" else proj[proj["am_name"] == sel_am_liq]
+
+                rows_pwr = []
+                for (am, reason), grp in src_liq.groupby(["am_name", "reason_display"]):
+                    row_data = {"Account Manager": am, "Reason": reason}
+                    for w in tw:
+                        wk_grp = grp[grp["week"] == w]
+                        row_data[f"W{w} AM"] = wk_grp["am_spend_eur"].sum()
+                        row_data[f"W{w} Liq"] = wk_grp["liquidity_spend_eur"].sum()
+                    row_data["Total AM"] = grp["am_spend_eur"].sum()
+                    row_data["Total Liq"] = grp["liquidity_spend_eur"].sum()
+                    row_data["Total"] = grp["weekly_projected_bolt_eur"].sum()
+                    rows_pwr.append(row_data)
+
+                pwr_df = pd.DataFrame(rows_pwr).sort_values(
+                    ["Account Manager", "Total"], ascending=[True, False]
+                )
+                st.dataframe(
+                    pwr_df.style.format(
+                        {c: "€{:,.0f}" for c in pwr_df.columns if c not in ("Account Manager", "Reason")}
+                    ),
+                    hide_index=True,
+                    height=500,
+                )
+                st.download_button("Download person/week/reason as CSV",
+                                   pwr_df.to_csv(index=False),
+                                   "person_week_reason.csv", "text/csv",
+                                   key="dl_pwr")
+
+                # ── Liquidity campaign detail ──
+                st.markdown("---")
+                st.markdown("**Liquidity Campaign Detail**")
+
+                liq_ams = sorted(liq_df["am_name"].unique())
+                sel_liq_am = st.selectbox(
+                    "Filter by AM", ["All"] + liq_ams,
+                    key="liq_detail_am",
+                )
+                liq_show = liq_df if sel_liq_am == "All" else liq_df[liq_df["am_name"] == sel_liq_am]
+
+                liq_detail = liq_show[[
+                    "am_name", "week", "provider_id", "provider_name", "city",
+                    "campaign_type", "discount_pct", "liquidity_base_pct",
+                    "am_topup_pct", "cost_share_pct", "reason_display",
+                    "weekly_projected_bolt_eur", "am_spend_eur",
+                    "liquidity_spend_eur", "match_method", "am_comment",
+                ]].rename(columns={
+                    "am_name": "AM", "week": "Week", "provider_id": "Provider ID",
+                    "provider_name": "Provider", "city": "City",
+                    "campaign_type": "Campaign", "discount_pct": "Total Disc %",
+                    "liquidity_base_pct": "Liq Base %", "am_topup_pct": "AM Top-up %",
+                    "cost_share_pct": "Provider Share %",
+                    "reason_display": "Reason",
+                    "weekly_projected_bolt_eur": "Total Projected",
+                    "am_spend_eur": "AM Spend (EUR)",
+                    "liquidity_spend_eur": "Liquidity (EUR)",
+                    "match_method": "Match Method",
+                    "am_comment": "AM Comment",
+                }).sort_values(["AM", "Week", "Total Projected"], ascending=[True, True, False])
+
+                st.dataframe(
+                    liq_detail.style.format({
+                        "Total Projected": "€{:,.0f}",
+                        "AM Spend (EUR)": "€{:,.0f}",
+                        "Liquidity (EUR)": "€{:,.0f}",
+                        "Provider ID": "{:.0f}",
+                        "Total Disc %": "{:.0f}",
+                        "Liq Base %": "{:.0f}",
+                        "AM Top-up %": "{:.0f}",
+                        "Provider Share %": "{:.0%}",
+                    }),
+                    hide_index=True,
+                    height=500,
+                )
+                st.caption(f"{len(liq_detail):,} liquidity campaigns")
+                st.download_button("Download liquidity detail as CSV",
+                                   liq_detail.to_csv(index=False),
+                                   "liquidity_detail.csv", "text/csv",
+                                   key="dl_liq_detail")
 
         # ── Week-over-Week Changes ────────────────────────────────────
         with sub_wow:
@@ -574,18 +736,32 @@ with tab_proj:
                 "avg_daily_bolt_eur": "Avg Daily (EUR)",
                 "weekly_projected_bolt_eur": "Weekly (EUR)",
             }
+            if has_liq:
+                col_map["am_spend_eur"] = "AM Spend (EUR)"
+                col_map["liquidity_spend_eur"] = "Liquidity (EUR)"
+                col_map["is_liquidity"] = "Liquidity?"
+
+            available_cols = [c for c in col_map.keys() if c in filtered.columns]
             detail = (
-                filtered[list(col_map.keys())]
+                filtered[available_cols]
                 .rename(columns=col_map)
                 .sort_values(["AM", "Week", "Weekly (EUR)"],
                              ascending=[True, True, False])
             )
+            if "Liquidity?" in detail.columns:
+                detail["Liquidity?"] = detail["Liquidity?"].map({True: "Yes", False: ""})
+
+            fmt_detail = {
+                "Avg Daily (EUR)": "€{:,.2f}",
+                "Weekly (EUR)": "€{:,.2f}",
+                "Provider ID": "{:.0f}",
+            }
+            if has_liq:
+                fmt_detail["AM Spend (EUR)"] = "€{:,.0f}"
+                fmt_detail["Liquidity (EUR)"] = "€{:,.0f}"
+
             st.dataframe(
-                detail.style.format({
-                    "Avg Daily (EUR)": "€{:,.2f}",
-                    "Weekly (EUR)": "€{:,.2f}",
-                    "Provider ID": "{:.0f}",
-                }),
+                detail.style.format(fmt_detail),
                 hide_index=True,
                 height=600,
             )
