@@ -10,6 +10,7 @@ import openpyxl
 import calendar
 import re
 import io
+import requests
 from pathlib import Path
 from datetime import date
 from contextlib import redirect_stdout
@@ -41,6 +42,16 @@ COUNTRIES = {
         "gmv_csv": str(DATA_DIR / "CZ" / "daily_gmv.csv"),
         "exclude_ams": ["Klára Bradová"],
         "exclude_spend_objectives": ["provider_campaign_locations"],
+        "google_sheets": {
+            "Jan Matějka - CZ campaigns 2026": "1jYFaJKX4uuKvKhcM3zLOCcdvftwRrCMYIoqINYGFF5w",
+            "Erika Šimková - CZ campaigns 2026": "1KFbT6IDdY48ElQ6UMyYSItSi1g__iGOtEj4fLiD1QR0",
+            "Anežka Rücklová - CZ campaigns 2026": "1-SZv-p-52ypwmIj57VfhP2BNzJxFHpz1Ggy2pOzkS0Q",
+            "Berta Šimonová - CZ campaigns 2026": "1j0hfBgbGG-DrfYIV1O0Zs7p8WJ5lQapcFuZBorRkMEw",
+            "Laura Ernestová - CZ campaigns 2026": "1mVkEOcYKMl5iuchL_1ZOmAXsH4qPjiR0Ecr-o1IiPZQ",
+            "Peter Ciuprik - CZ campaigns 2026": "1J8ExwH8U5ae_PwaMgN92KKPmwhRY4dStF4FVgeW3Rd0",
+            "Lukáš Bílý - CZ campaigns 2026": "1t6eIku63Apz74tZUWBji6J1xUPbHffLJdsu56Iewboo",
+            "Marketing forms - CZ campaigns 2026": "1QcHGAi40E2WGJfOm6UnimFas0itzvZV79z6T5uhR23I",
+        },
     },
 }
 
@@ -85,6 +96,36 @@ def scan_uploaded_files(file_buffers, target_weeks):
             "Skipped Tabs": ", ".join(skipped) or "—",
         })
     return pd.DataFrame(rows)
+
+
+def fetch_google_sheets(sheets_config):
+    """Download Google Sheets as .xlsx files into memory.
+
+    Args:
+        sheets_config: dict mapping "AM Name - Country campaigns Year" -> sheet_id
+
+    Returns:
+        (files_dict, errors_list) where files_dict maps "name.xlsx" -> BytesIO
+    """
+    files = {}
+    errors = []
+    for label, sheet_id in sheets_config.items():
+        url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=xlsx"
+        try:
+            resp = requests.get(url, timeout=60)
+            if resp.status_code == 200 and resp.headers.get(
+                "content-type", ""
+            ).startswith("application/vnd.openxmlformats"):
+                fname = f"{label}.xlsx"
+                files[fname] = io.BytesIO(resp.content)
+            else:
+                errors.append(
+                    f"{label}: HTTP {resp.status_code} "
+                    f"(may require sign-in or is not shared publicly)"
+                )
+        except requests.RequestException as e:
+            errors.append(f"{label}: {e}")
+    return files, errors
 
 
 @st.cache_data(show_spinner=False)
@@ -183,8 +224,11 @@ with st.sidebar:
     n_am = len(st.session_state["am_files"])
     hist_ok = Path(cc["historical_csv"]).exists()
     gmv_ok = Path(cc["gmv_csv"]).exists()
+    has_gsheets = bool(cc.get("google_sheets"))
 
-    st.caption(f"{'✅' if n_am > 0 else '❌'} {n_am} AM files uploaded")
+    st.caption(f"{'✅' if n_am > 0 else '❌'} {n_am} AM files loaded")
+    if n_am == 0 and has_gsheets:
+        st.caption("   ↳ Click **Fetch Sheets** in the AM tab")
     st.caption(f"{'✅' if hist_ok else '❌'} Historical spend CSV")
     st.caption(f"{'✅' if gmv_ok else '❌'} Daily GMV CSV")
 
@@ -215,27 +259,53 @@ tab_am, tab_proj, tab_data = st.tabs([
 with tab_am:
     st.subheader("AM Campaign Files")
 
-    st.markdown("**Upload AM campaign files**")
-    st.caption("Upload .xlsx files for the AMs you want to project. "
-               "Re-uploading a file with the same name replaces the previous one.")
-    uploaded = st.file_uploader("Drop .xlsx files here", type=["xlsx"],
-                                accept_multiple_files=True, key="am_uploader")
-    if uploaded:
-        for f in uploaded:
-            st.session_state["am_files"][f.name] = io.BytesIO(f.getvalue())
+    gsheets = cc.get("google_sheets", {})
+
+    if gsheets:
+        st.markdown("**Fetch from Google Sheets**")
+        st.caption(
+            f"{len(gsheets)} sheets configured for {cc['name']}. "
+            "Click the button to download the latest data directly."
+        )
+        fetch_col1, fetch_col2 = st.columns([1, 3])
+        with fetch_col1:
+            fetch_btn = st.button("Fetch Sheets", type="primary",
+                                  use_container_width=True)
+        if fetch_btn:
+            with st.spinner(f"Downloading {len(gsheets)} sheets from Google..."):
+                fetched, fetch_errors = fetch_google_sheets(gsheets)
+            if fetched:
+                st.session_state["am_files"].update(fetched)
+                st.success(f"Loaded {len(fetched)} sheets from Google.")
+            if fetch_errors:
+                for err in fetch_errors:
+                    st.warning(err)
+            if fetched:
+                st.rerun()
+
+        st.divider()
+
+    with st.expander("Manual upload (optional)"):
+        st.caption("Upload .xlsx files for AMs not in Google Sheets, "
+                   "or to override a fetched file.")
+        uploaded = st.file_uploader("Drop .xlsx files here", type=["xlsx"],
+                                    accept_multiple_files=True, key="am_uploader")
+        if uploaded:
+            for f in uploaded:
+                st.session_state["am_files"][f.name] = io.BytesIO(f.getvalue())
 
     if st.session_state["am_files"]:
-        if st.button("Clear all uploaded files"):
+        if st.button("Clear all files"):
             st.session_state["am_files"] = {}
             st.rerun()
 
         if len(target_weeks) > 0:
             st.divider()
-            st.markdown("**Uploaded files & detected week tabs**")
+            st.markdown("**Loaded files & detected week tabs**")
             scan_df = scan_uploaded_files(st.session_state["am_files"], target_weeks)
             st.dataframe(scan_df, hide_index=True)
     else:
-        st.info("No files uploaded yet. Drop AM campaign .xlsx files above.")
+        st.info("No files loaded yet. Click **Fetch Sheets** above to get started.")
 
     st.divider()
     with st.expander("Tab naming rules"):
